@@ -144,6 +144,10 @@ def _donate_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _user_continue_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(MENU_WRITE, callback_data="user:write")]])
+
+
 def _relay_index(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
     # admin_message_id -> user_id
     if "relay_index" not in context.application.bot_data:
@@ -156,6 +160,34 @@ def _reply_prompts(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
     if "reply_prompts" not in context.application.bot_data:
         context.application.bot_data["reply_prompts"] = {}
     return context.application.bot_data["reply_prompts"]
+
+
+def _broadcast_prompts(context: ContextTypes.DEFAULT_TYPE) -> Set[int]:
+    # prompt_message_id set
+    if "broadcast_prompts" not in context.application.bot_data:
+        context.application.bot_data["broadcast_prompts"] = set()
+    return context.application.bot_data["broadcast_prompts"]
+
+
+def _users_db(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, object]]:
+    # user_id(str) -> {username, first_name, last_name, first_seen, last_seen}
+    if "users" not in context.application.bot_data:
+        context.application.bot_data["users"] = {}
+    return context.application.bot_data["users"]
+
+
+def _touch_user(context: ContextTypes.DEFAULT_TYPE, u) -> None:
+    users = _users_db(context)
+    uid = str(u.id)
+    now = int(time.time())
+    rec = users.get(uid) or {}
+    if "first_seen" not in rec:
+        rec["first_seen"] = now
+    rec["last_seen"] = now
+    rec["username"] = u.username or ""
+    rec["first_name"] = u.first_name or ""
+    rec["last_name"] = u.last_name or ""
+    users[uid] = rec
 
 
 def _banned_users(context: ContextTypes.DEFAULT_TYPE) -> Set[int]:
@@ -181,11 +213,20 @@ def _load_persistent_data() -> Dict[str, object]:
         return {}
 
 
-def _save_persistent_data(*, banned_users: Set[int]) -> None:
-    data = {"banned_users": sorted(banned_users)}
+def _save_persistent_data(*, banned_users: Set[int], users: Optional[Dict[str, object]] = None) -> None:
+    data: Dict[str, object] = {"banned_users": sorted(banned_users)}
+    if users is not None:
+        data["users"] = users
     tmp = DATA_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(DATA_PATH)
+
+
+def _persist(context: ContextTypes.DEFAULT_TYPE) -> None:
+    _save_persistent_data(
+        banned_users=_banned_users(context),
+        users=_users_db(context),
+    )
 
 
 def _is_flooding(*, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -205,10 +246,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await menu_donate(update, context)
         return
     text = (
-        "Привет! Я работаю как <b>автоответчик‑курьер</b>.\n\n"
-        "Ты пишешь мне — я мгновенно доставляю сообщение админу.\n"
-        "Если нужно — админ ответит тебе через меня.\n\n"
-        "Кнопки снизу — для удобства (донат ⭐ и подсказка)."
+        "Привет, я <b>бот обратной связи</b>.\n\n"
+        "Просто напиши сообщение — я передам его администратору.\n"
+        "Когда админ ответит, ты сможешь продолжить диалог прямо здесь."
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
 
@@ -217,7 +257,7 @@ async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message:
         return
     await update.message.reply_text(
-        "Напиши сообщение — я мгновенно доставлю его админу.\n\n"
+        "Пиши сообщение — я сразу отправлю его администратору.\n\n"
         "Можно отправлять: текст, фото, видео, голос, файл.",
         reply_markup=MAIN_MENU,
     )
@@ -414,7 +454,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "ban":
         banned = _banned_users(context)
         banned.add(user_id)
-        _save_persistent_data(banned_users=banned)
+        _persist(context)
         await q.message.reply_text(
             f"Готово. Пользователь <code>{user_id}</code> забанен: новые сообщения от него не будут приниматься.",
             parse_mode=ParseMode.HTML,
@@ -434,7 +474,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "unban":
         banned = _banned_users(context)
         banned.discard(user_id)
-        _save_persistent_data(banned_users=banned)
+        _persist(context)
         await q.message.reply_text(
             f"Готово. Пользователь <code>{user_id}</code> разбанен.",
             parse_mode=ParseMode.HTML,
@@ -470,7 +510,30 @@ async def admin_reply_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             from_chat_id=msg.chat_id,
             message_id=msg.message_id,
         )
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="Если хочешь продолжить — нажми кнопку ниже и напиши сообщение.",
+            reply_markup=_user_continue_keyboard(),
+        )
         await msg.reply_text("Доставлено пользователю ✅")
+        raise ApplicationHandlerStop
+
+    # 1.5) рассылка: админ отвечает на prompt рассылки
+    bprompts = _broadcast_prompts(context)
+    if msg.reply_to_message.message_id in bprompts:
+        bprompts.discard(msg.reply_to_message.message_id)
+        users = _users_db(context)
+        banned = _banned_users(context)
+        targets = [int(uid) for uid in users.keys() if int(uid) != ADMIN_ID and int(uid) not in banned]
+        ok = 0
+        fail = 0
+        for uid in targets:
+            try:
+                await context.bot.copy_message(chat_id=uid, from_chat_id=msg.chat_id, message_id=msg.message_id)
+                ok += 1
+            except Exception:
+                fail += 1
+        await msg.reply_text(f"Рассылка завершена. Успешно: {ok}, ошибок: {fail}.")
         raise ApplicationHandlerStop
 
     # 2) ответ reply на пересланное/скопированное сообщение пользователя
@@ -481,6 +544,11 @@ async def admin_reply_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat_id=target_user_id2,
             from_chat_id=msg.chat_id,
             message_id=msg.message_id,
+        )
+        await context.bot.send_message(
+            chat_id=target_user_id2,
+            text="Если хочешь продолжить — нажми кнопку ниже и напиши сообщение.",
+            reply_markup=_user_continue_keyboard(),
         )
         await msg.reply_text("Доставлено пользователю ✅")
         raise ApplicationHandlerStop
@@ -521,7 +589,7 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     banned = _banned_users(context)
     banned.add(user_id)
-    _save_persistent_data(banned_users=banned)
+    _persist(context)
     await update.message.reply_text(f"Забанен: <code>{user_id}</code>", parse_mode=ParseMode.HTML)
 
 
@@ -536,7 +604,7 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     banned = _banned_users(context)
     banned.discard(user_id)
-    _save_persistent_data(banned_users=banned)
+    _persist(context)
     await update.message.reply_text(f"Разбанен: <code>{user_id}</code>", parse_mode=ParseMode.HTML)
 
 
@@ -548,6 +616,10 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if not user:
         return
+
+    _touch_user(context, user)
+    # сохраняем пользователей лениво (не идеально, но просто и надёжно)
+    _persist(context)
 
     # Меню должно работать и у админа (например, для теста доната),
     # но сообщения админа не должны пересылаться самому себе.
@@ -635,6 +707,201 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     raise ApplicationHandlerStop
 
 
+async def user_write_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    await q.message.reply_text(
+        "Пиши сообщение — я передам его администратору.",
+        reply_markup=MAIN_MENU,
+    )
+
+
+def _fmt_user_row(uid: str, rec: Dict[str, object]) -> str:
+    name = " ".join([str(rec.get("first_name") or "").strip(), str(rec.get("last_name") or "").strip()]).strip()
+    if not name:
+        name = "Пользователь"
+    username = str(rec.get("username") or "").strip()
+    u = f"@{username}" if username else "—"
+    return f"{name} | {u} | <code>{uid}</code>"
+
+
+async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+
+    users = _users_db(context)
+    banned = _banned_users(context)
+    now = int(time.time())
+    active_24h = 0
+    for rec in users.values():
+        last_seen = int(rec.get("last_seen") or 0)
+        if now - last_seen <= 24 * 3600:
+            active_24h += 1
+
+    text = (
+        "<b>/op — панель администратора</b>\n\n"
+        f"— <b>Пользователей</b>: {len(users)}\n"
+        f"— <b>Активных за 24ч</b>: {active_24h}\n"
+        f"— <b>В бане</b>: {len(banned)}\n"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👥 Пользователи", callback_data="op:users:0")],
+            [InlineKeyboardButton("📣 Рассылка всем", callback_data="op:broadcast")],
+        ]
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def op_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    actor = update.effective_user
+    if not actor or actor.id != ADMIN_ID:
+        await q.answer("Только для администратора.", show_alert=True)
+        return
+    await q.answer()
+
+    data = q.data or ""
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "op":
+        return
+
+    users = _users_db(context)
+    banned = _banned_users(context)
+
+    if parts[1] == "broadcast":
+        prompt = await q.message.reply_text(
+            "Рассылка всем пользователям.\n"
+            "Ответь <b>reply</b> на это сообщение текстом/медиа — я разошлю всем (кроме забаненных).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True),
+        )
+        _broadcast_prompts(context).add(prompt.message_id)
+        return
+
+    if parts[1] == "users":
+        page = 0
+        if len(parts) >= 3 and (parts[2] or "").isdigit():
+            page = int(parts[2])
+        context.user_data["op_page"] = page
+
+        sorted_ids = sorted(
+            users.keys(),
+            key=lambda uid: int((users[uid].get("last_seen") or 0)),
+            reverse=True,
+        )
+        per = 10
+        start = page * per
+        chunk = sorted_ids[start : start + per]
+
+        lines = [_fmt_user_row(uid, users[uid]) for uid in chunk] or ["(пока пусто)"]
+        text = "<b>Пользователи</b>\n\n" + "\n".join(lines)
+
+        kb_rows: List[List[InlineKeyboardButton]] = []
+        for uid in chunk:
+            rec = users[uid]
+            name = " ".join([str(rec.get("first_name") or ""), str(rec.get("last_name") or "")]).strip() or uid
+            kb_rows.append([InlineKeyboardButton(f"{name} ({uid})", callback_data=f"op:user:{uid}")])
+
+        nav: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"op:users:{page-1}"))
+        if start + per < len(sorted_ids):
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"op:users:{page+1}"))
+        if nav:
+            kb_rows.append(nav)
+        kb_rows.append([InlineKeyboardButton("↩️ Назад", callback_data="op:home")])
+
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
+
+    if parts[1] == "home":
+        # Перерисовываем панель без “трюков” с Update
+        users = _users_db(context)
+        banned = _banned_users(context)
+        now = int(time.time())
+        active_24h = 0
+        for rec in users.values():
+            last_seen = int(rec.get("last_seen") or 0)
+            if now - last_seen <= 24 * 3600:
+                active_24h += 1
+        text = (
+            "<b>/op — панель администратора</b>\n\n"
+            f"— <b>Пользователей</b>: {len(users)}\n"
+            f"— <b>Активных за 24ч</b>: {active_24h}\n"
+            f"— <b>В бане</b>: {len(banned)}\n"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("👥 Пользователи", callback_data="op:users:0")],
+                [InlineKeyboardButton("📣 Рассылка всем", callback_data="op:broadcast")],
+            ]
+        )
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if parts[1] == "user" and len(parts) >= 3:
+        uid = parts[2]
+        rec = users.get(uid)
+        if not rec:
+            await q.message.reply_text("Пользователь не найден.")
+            return
+        is_b = int(uid) in banned
+        text = (
+            "<b>Пользователь</b>\n"
+            f"{_fmt_user_row(uid, rec)}\n\n"
+            f"Профиль: <a href=\"{_h(_profile_url_by_user_id(int(uid)))}\">открыть</a>"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✉️ Написать", callback_data=f"op:msg:{uid}")],
+                [
+                    InlineKeyboardButton(
+                        "✅ Разбанить" if is_b else "🚫 Забанить",
+                        callback_data=f"op:{'unban' if is_b else 'ban'}:{uid}",
+                    )
+                ],
+                [InlineKeyboardButton("↩️ К списку", callback_data=f"op:users:{int(context.user_data.get('op_page') or 0)}")],
+            ]
+        )
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if parts[1] in {"ban", "unban"} and len(parts) >= 3:
+        uid = parts[2]
+        if not uid.isdigit():
+            return
+        n = int(uid)
+        if parts[1] == "ban":
+            banned.add(n)
+        else:
+            banned.discard(n)
+        _persist(context)
+        await q.message.reply_text("Готово.")
+        return
+
+    if parts[1] == "msg" and len(parts) >= 3:
+        uid = parts[2]
+        if not uid.isdigit():
+            return
+        n = int(uid)
+        prompt = await q.message.reply_text(
+            "Напиши сообщение пользователю (ответь <b>reply</b> на это сообщение):\n"
+            f"— <b>ID</b>: <code>{n}</code>\n"
+            f"— <b>Профиль</b>: <a href=\"{_h(_profile_url_by_user_id(n))}\">открыть</a>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True),
+        )
+        _reply_prompts(context)[prompt.message_id] = n
+        return
+
+
 def build_app() -> Application:
     if not BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
         raise RuntimeError("Заполни BOT_TOKEN в config.py")
@@ -646,16 +913,21 @@ def build_app() -> Application:
     data = _load_persistent_data()
     banned = set(int(x) for x in (data.get("banned_users") or []) if str(x).isdigit())
     app.bot_data["banned_users"] = banned
+    users = data.get("users") if isinstance(data.get("users"), dict) else {}
+    app.bot_data["users"] = users
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("gift", gift_cmd))
+    app.add_handler(CommandHandler("op", op_cmd))
     app.add_handler(CommandHandler("bans", bans_list))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
 
     app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate:"))
     app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(user_write_callback, pattern=r"^user:write$"))
+    app.add_handler(CallbackQueryHandler(op_callback, pattern=r"^op:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
