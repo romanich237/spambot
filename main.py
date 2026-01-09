@@ -1,8 +1,9 @@
+import html
+
 import re
 import time
 import json
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Dict, Optional, Set, List
 
 from telegram import (
@@ -31,13 +32,11 @@ from config import ADMIN_ID, BOT_TOKEN
 MENU_WRITE = "✍️ Написать"
 MENU_DONATE = "⭐ Задонатить"
 
-
 MAIN_MENU = ReplyKeyboardMarkup(
     [[MENU_WRITE, MENU_DONATE]],
     resize_keyboard=True,
-    input_field_placeholder="Выбирай кнопку или просто пиши…",
+    input_field_placeholder="Пиши сообщение или жми кнопку…",
 )
-
 
 PRESET_STARS = (50, 100, 250, 500, 1000)
 
@@ -46,11 +45,18 @@ FLOOD_WINDOW_SEC = 30
 FLOOD_MAX_MESSAGES = 4
 
 
+def _h(s: str) -> str:
+    return html.escape(s or "")
+
+
+def _profile_url_by_user_id(user_id: int) -> str:
+    return f"tg://user?id={user_id}"
+
+
 def _profile_url(u) -> str:
-    # Если username нет, tg://user?id=... открывает профиль в большинстве клиентов
     if getattr(u, "username", None):
         return f"https://t.me/{u.username}"
-    return f"tg://user?id={u.id}"
+    return _profile_url_by_user_id(u.id)
 
 
 def _admin_user_keyboard(*, user_id: int, profile_url: str, is_banned: bool) -> InlineKeyboardMarkup:
@@ -72,18 +78,18 @@ def _admin_user_keyboard(*, user_id: int, profile_url: str, is_banned: bool) -> 
 
 def _user_card(u) -> str:
     username = f"@{u.username}" if u.username else "—"
-    full_name = " ".join(p for p in [u.first_name, u.last_name] if p) or "—"
+    full_name = " ".join(p for p in [u.first_name, u.last_name] if p) or "Пользователь"
+    link = _profile_url(u)
     return (
-        f"<b>Новый сигнал в эфир</b>\n"
-        f"— <b>От</b>: {full_name}\n"
-        f"— <b>Username</b>: {username}\n"
+        f"<b>Сообщение от</b>: <a href=\"{_h(link)}\">{_h(full_name)}</a>\n"
+        f"— <b>Username</b>: {_h(username)}\n"
         f"— <b>ID</b>: <code>{u.id}</code>\n"
     )
 
 
 def _donate_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    row = []
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
     for i, stars in enumerate(PRESET_STARS, start=1):
         row.append(InlineKeyboardButton(f"{stars} ⭐", callback_data=f"donate:{stars}"))
         if i % 3 == 0:
@@ -95,16 +101,18 @@ def _donate_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-@dataclass
-class RelayIndex:
+def _relay_index(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
     # admin_message_id -> user_id
-    by_admin_msg_id: Dict[int, int]
-
-
-def _relay_index(context: ContextTypes.DEFAULT_TYPE) -> RelayIndex:
     if "relay_index" not in context.application.bot_data:
-        context.application.bot_data["relay_index"] = RelayIndex(by_admin_msg_id={})
+        context.application.bot_data["relay_index"] = {}
     return context.application.bot_data["relay_index"]
+
+
+def _reply_prompts(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
+    # prompt_message_id -> user_id
+    if "reply_prompts" not in context.application.bot_data:
+        context.application.bot_data["reply_prompts"] = {}
+    return context.application.bot_data["reply_prompts"]
 
 
 def _banned_users(context: ContextTypes.DEFAULT_TYPE) -> Set[int]:
@@ -113,15 +121,8 @@ def _banned_users(context: ContextTypes.DEFAULT_TYPE) -> Set[int]:
     return context.application.bot_data["banned_users"]
 
 
-def _admin_pending_reply(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
-    # admin_id -> user_id
-    if "admin_pending_reply" not in context.application.bot_data:
-        context.application.bot_data["admin_pending_reply"] = {}
-    return context.application.bot_data["admin_pending_reply"]
-
-
 def _flood_index(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, List[float]]:
-    # user_id -> timestamps (monotonic) последних сообщений
+    # user_id -> timestamps (monotonic)
     if "flood_index" not in context.application.bot_data:
         context.application.bot_data["flood_index"] = {}
     return context.application.bot_data["flood_index"]
@@ -134,7 +135,6 @@ def _load_persistent_data() -> Dict[str, object]:
         raw = DATA_PATH.read_text(encoding="utf-8")
         return json.loads(raw) if raw.strip() else {}
     except Exception:
-        log.exception("Failed to load %s", DATA_PATH)
         return {}
 
 
@@ -155,195 +155,89 @@ def _is_flooding(*, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return len(stamps) > FLOOD_MAX_MESSAGES
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    text = (
-        "Привет! Я — маленький телеграм‑почтальон.\n\n"
-        "Моя работа простая и важная: ты пишешь — я аккуратно доставляю это админу.\n"
-        "Хочешь поддержать проект звёздами? Тоже умею.\n\n"
-        "<b>Выбирай действие кнопками ниже.</b>"
-    )
-    await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
-    return ConversationHandler.END
-
-
-async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    user = update.effective_user
-    if user and user.id in _banned_users(context):
-        await update.message.reply_text(
-            "Упс. Этот почтовый ящик для тебя закрыт.\n"
-            "Если думаешь, что это ошибка — попробуй связаться с админом другим способом.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
-    text = (
-        "Окей! Сейчас я включу режим «радиостанция».\n\n"
-        "Напиши одно сообщение (текст/фото/видео/файл/голос — что угодно), и я отправлю это админу.\n"
-        "Чтобы выйти без отправки — напиши <code>/cancel</code>."
-    )
-    await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
-    return WRITE_WAITING_MESSAGE
-
-
-async def write_receive_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    user = update.effective_user
-    if not user:
-        return ConversationHandler.END
-
-    if user.id in _banned_users(context):
-        await update.message.reply_text(
-            "Сообщение не отправлено: доступ к боту для тебя ограничен.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
-    if _is_flooding(user_id=user.id, context=context):
-        await update.message.reply_text(
-            "Слишком быстро 🙂 Дай мне 20–30 секунд перевести дух и попробуй ещё раз.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
-    # 1) карточка отправителя
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=_user_card(user),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_admin_user_keyboard(
-            user_id=user.id,
-            profile_url=_profile_url(user),
-            is_banned=(user.id in _banned_users(context)),
-        ),
-    )
-
-    # 2) копия исходного сообщения (с сохранением медиа)
-    copied = await context.bot.copy_message(
-        chat_id=ADMIN_ID,
-        from_chat_id=update.effective_chat.id,
-        message_id=update.message.message_id,
-    )
-
-    idx = _relay_index(context)
-    idx.by_admin_msg_id[copied.message_id] = user.id
-
-    # 3) подтверждение пользователю
-    await update.message.reply_text(
-        "Готово! Доставил админу. Если понадобится уточнение — он ответит через меня.",
-        reply_markup=MAIN_MENU,
-    )
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message:
-        await update.message.reply_text(
-            "Принято. Сворачиваю крылья и жду следующую команду.",
-            reply_markup=MAIN_MENU,
-        )
-    return ConversationHandler.END
-
-
-async def user_fallback_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Если пользователь пишет не нажимая "Написать" — мягко направляем.
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
+    text = (
+        "Привет! Я работаю как <b>автоответчик‑курьер</b>.\n\n"
+        "Ты пишешь мне — я мгновенно доставляю сообщение админу.\n"
+        "Если нужно — админ ответит тебе через меня.\n\n"
+        "Кнопки снизу — для удобства (донат ⭐ и подсказка)."
+    )
+    await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
+
+
+async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
     await update.message.reply_text(
-        "Я тебя услышал 🙂\n\n"
-        "Чтобы я доставил сообщение админу, нажми кнопку <b>«Написать»</b> и отправь сообщение ещё раз.",
+        "Я уже в режиме автоответчика 🙂\n\n"
+        "Просто напиши сообщение (текст/фото/видео/голос/файл) — я доставлю его админу.",
         reply_markup=MAIN_MENU,
-        parse_mode=ParseMode.HTML,
     )
 
 
-async def menu_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def menu_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
-        return ConversationHandler.END
-
+        return
     text = (
         "Спасибо, что хочешь поддержать!\n\n"
         "Оплата — в <b>Telegram Stars</b> (официальная валюта Telegram).\n"
         "Выбери сумму или введи свою."
     )
-    await update.message.reply_text(
-        text,
-        reply_markup=MAIN_MENU,
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
     await update.message.reply_text("Сколько звёзд отправим? ⭐", reply_markup=_donate_keyboard())
-    return ConversationHandler.END
 
 
-async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if context.user_data.get("awaiting_donate_amount"):
+        context.user_data.pop("awaiting_donate_amount", None)
+        await update.message.reply_text("Окей, отменил ввод суммы.", reply_markup=MAIN_MENU)
+        return
+    await update.message.reply_text("Окей.", reply_markup=MAIN_MENU)
+
+
+async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
-        return ConversationHandler.END
-
+        return
     await q.answer()
+
     data = q.data or ""
     if not data.startswith("donate:"):
-        return ConversationHandler.END
+        return
 
     value = data.split(":", 1)[1]
     if value == "custom":
+        context.user_data["awaiting_donate_amount"] = True
         await q.message.reply_text(
-            "Введи число звёзд (например: <code>123</code>).",
+            "Введи число звёзд (например: <code>123</code>). Чтобы отменить — /cancel.",
             parse_mode=ParseMode.HTML,
         )
-        return DONATE_WAITING_CUSTOM_AMOUNT
+        return
 
     try:
         stars = int(value)
     except ValueError:
         await q.message.reply_text("Не понял сумму. Попробуй ещё раз.", reply_markup=_donate_keyboard())
-        return ConversationHandler.END
+        return
 
-    return await _send_stars_invoice(q.from_user.id, stars, context, q.message)
-
-
-async def donate_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-
-    raw = (update.message.text or "").strip()
-    m = re.fullmatch(r"\d{1,6}", raw)
-    if not m:
-        await update.message.reply_text("Нужно число звёзд (только цифры). Попробуй ещё раз.")
-        return DONATE_WAITING_CUSTOM_AMOUNT
-
-    stars = int(raw)
-    if stars <= 0:
-        await update.message.reply_text("Сумма должна быть больше нуля 🙂 Попробуй ещё раз.")
-        return DONATE_WAITING_CUSTOM_AMOUNT
-
-    if stars > 1_000_000:
-        await update.message.reply_text("Слишком много за раз. Введи сумму поменьше 🙂")
-        return DONATE_WAITING_CUSTOM_AMOUNT
-
-    return await _send_stars_invoice(update.effective_user.id, stars, context, update.message)
+    await _send_stars_invoice(user_id=q.from_user.id, stars=stars, context=context, reply_to=q.message)
 
 
 async def _send_stars_invoice(
+    *,
     user_id: int,
     stars: int,
     context: ContextTypes.DEFAULT_TYPE,
     reply_to,
-) -> int:
+) -> None:
     title = "Поддержка проекта ⭐"
     description = "Спасибо! Это помогает проекту жить, развиваться и не терять чувство юмора."
     payload = f"donate_{user_id}_{stars}"
 
-    # Telegram Stars: currency="XTR", provider_token="" (пустая строка).
     await context.bot.send_invoice(
         chat_id=user_id,
         title=title,
@@ -356,17 +250,15 @@ async def _send_stars_invoice(
     )
     if reply_to:
         await reply_to.reply_text(
-            f"Супер! Сформировал счёт на <b>{stars} ⭐</b>.",
+            f"Сформировал счёт на <b>{stars} ⭐</b>.",
             parse_mode=ParseMode.HTML,
         )
-    return ConversationHandler.END
 
 
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.pre_checkout_query
     if not q:
         return
-
     ok = bool(q.invoice_payload and q.invoice_payload.startswith("donate_"))
     if ok:
         await q.answer(ok=True)
@@ -395,35 +287,13 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat_id=ADMIN_ID,
             text=(
                 "<b>Новый донат ⭐</b>\n"
-                f"— <b>От</b>: {user.first_name}\n"
-                f"— <b>Username</b>: {username}\n"
+                f"— <b>От</b>: {_h(user.first_name)}\n"
+                f"— <b>Username</b>: {_h(username)}\n"
                 f"— <b>ID</b>: <code>{user.id}</code>\n"
                 f"— <b>Сумма</b>: <b>{total} ⭐</b>\n"
             ),
             parse_mode=ParseMode.HTML,
         )
-
-
-async def admin_reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message
-    if not msg or not msg.reply_to_message:
-        return
-
-    idx = _relay_index(context)
-    target_user_id: Optional[int] = idx.by_admin_msg_id.get(msg.reply_to_message.message_id)
-    if not target_user_id:
-        await msg.reply_text(
-            "Не понял, кому отвечать. Ответь (reply) на сообщение, которое я скопировал от пользователя."
-        )
-        return
-
-    await context.bot.copy_message(
-        chat_id=target_user_id,
-        from_chat_id=msg.chat_id,
-        message_id=msg.message_id,
-    )
-
-    await msg.reply_text("Доставлено пользователю ✅")
 
 
 async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -438,11 +308,8 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     await q.answer()
     data = q.data or ""
-    if not data.startswith("admin:"):
-        return
-
     parts = data.split(":")
-    if len(parts) != 3:
+    if len(parts) != 3 or parts[0] != "admin":
         return
 
     action, raw_user_id = parts[1], parts[2]
@@ -452,62 +319,89 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == "reply":
-        pending = _admin_pending_reply(context)
-        pending[ADMIN_ID] = user_id
-        await q.message.reply_text(
-            "Режим ответа включён.\n"
-            "Напиши сообщение следующим сообщением — я доставлю его пользователю.\n"
-            "Чтобы отменить — напиши /cancel.",
-            reply_markup=MAIN_MENU,
+        prompt = await q.message.reply_text(
+            "Напиши ответ пользователю (ответь <b>reply</b> на это сообщение):\n"
+            f"— <b>ID</b>: <code>{user_id}</code>\n"
+            f"— <b>Профиль</b>: <a href=\"{_h(_profile_url_by_user_id(user_id))}\">открыть</a>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True),
         )
+        _reply_prompts(context)[prompt.message_id] = user_id
         return
 
     if action == "ban":
         banned = _banned_users(context)
         banned.add(user_id)
         _save_persistent_data(banned_users=banned)
-        pending = _admin_pending_reply(context)
-        if pending.get(ADMIN_ID) == user_id:
-            pending.pop(ADMIN_ID, None)
         await q.message.reply_text(
             f"Готово. Пользователь <code>{user_id}</code> забанен: новые сообщения от него не будут приниматься.",
             parse_mode=ParseMode.HTML,
         )
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=_admin_user_keyboard(
+                    user_id=user_id,
+                    profile_url=_profile_url_by_user_id(user_id),
+                    is_banned=True,
+                )
+            )
+        except Exception:
+            pass
         return
 
     if action == "unban":
         banned = _banned_users(context)
-        if user_id in banned:
-            banned.remove(user_id)
-            _save_persistent_data(banned_users=banned)
+        banned.discard(user_id)
+        _save_persistent_data(banned_users=banned)
         await q.message.reply_text(
             f"Готово. Пользователь <code>{user_id}</code> разбанен.",
             parse_mode=ParseMode.HTML,
         )
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=_admin_user_keyboard(
+                    user_id=user_id,
+                    profile_url=_profile_url_by_user_id(user_id),
+                    is_banned=False,
+                )
+            )
+        except Exception:
+            pass
         return
 
 
-async def admin_send_pending_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def admin_reply_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
-    if not msg:
+    if not msg or not msg.reply_to_message:
         return
 
     actor = update.effective_user
     if not actor or actor.id != ADMIN_ID:
         return
 
-    pending = _admin_pending_reply(context)
-    target_user_id = pending.get(ADMIN_ID)
-    if not target_user_id:
-        return
+    # 1) ответ на ForceReply-подсказку (кнопка "Ответить")
+    prompts = _reply_prompts(context)
+    target_user_id = prompts.pop(msg.reply_to_message.message_id, None)
+    if target_user_id:
+        await context.bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
+        )
+        await msg.reply_text("Доставлено пользователю ✅")
+        raise ApplicationHandlerStop
 
-    await context.bot.copy_message(
-        chat_id=target_user_id,
-        from_chat_id=msg.chat_id,
-        message_id=msg.message_id,
-    )
-    pending.pop(ADMIN_ID, None)
-    await msg.reply_text("Доставлено пользователю ✅")
+    # 2) ответ reply на пересланное/скопированное сообщение пользователя
+    relay = _relay_index(context)
+    target_user_id2: Optional[int] = relay.get(msg.reply_to_message.message_id)
+    if target_user_id2:
+        await context.bot.copy_message(
+            chat_id=target_user_id2,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
+        )
+        await msg.reply_text("Доставлено пользователю ✅")
+        raise ApplicationHandlerStop
 
 
 async def bans_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -564,6 +458,77 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Разбанен: <code>{user_id}</code>", parse_mode=ParseMode.HTML)
 
 
+async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+    if user.id == ADMIN_ID:
+        return
+
+    if user.id in _banned_users(context):
+        await msg.reply_text(
+            "Упс. Этот автоответчик для тебя закрыт.\n"
+            "Если думаешь, что это ошибка — попробуй связаться с админом другим способом.",
+            reply_markup=MAIN_MENU,
+        )
+        raise ApplicationHandlerStop
+
+    # Кнопки меню (текстом)
+    if msg.text == MENU_WRITE:
+        await menu_write(update, context)
+        raise ApplicationHandlerStop
+    if msg.text == MENU_DONATE:
+        await menu_donate(update, context)
+        raise ApplicationHandlerStop
+
+    # Ввод своей суммы доната
+    if context.user_data.get("awaiting_donate_amount"):
+        raw = (msg.text or "").strip()
+        if not re.fullmatch(r"\d{1,6}", raw):
+            await msg.reply_text("Нужно число звёзд (только цифры). Чтобы отменить — /cancel.")
+            raise ApplicationHandlerStop
+        stars = int(raw)
+        if stars <= 0:
+            await msg.reply_text("Сумма должна быть больше нуля. Попробуй ещё раз.")
+            raise ApplicationHandlerStop
+        context.user_data.pop("awaiting_donate_amount", None)
+        await _send_stars_invoice(user_id=user.id, stars=stars, context=context, reply_to=msg)
+        raise ApplicationHandlerStop
+
+    if _is_flooding(user_id=user.id, context=context):
+        await msg.reply_text("Слишком быстро 🙂 Подожди 20–30 секунд и попробуй ещё раз.", reply_markup=MAIN_MENU)
+        raise ApplicationHandlerStop
+
+    # Автоответчик: всегда пересылаем админу
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=_user_card(user),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_admin_user_keyboard(
+            user_id=user.id,
+            profile_url=_profile_url(user),
+            is_banned=(user.id in _banned_users(context)),
+        ),
+    )
+
+    copied = await context.bot.copy_message(
+        chat_id=ADMIN_ID,
+        from_chat_id=update.effective_chat.id,
+        message_id=msg.message_id,
+    )
+    _relay_index(context)[copied.message_id] = user.id
+
+    await msg.reply_text(
+        "Принято! Я передал твоё сообщение админу. Если будет ответ — я доставлю его сюда.",
+        reply_markup=MAIN_MENU,
+    )
+    raise ApplicationHandlerStop
+
+
 def build_app() -> Application:
     if not BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
         raise RuntimeError("Заполни BOT_TOKEN в config.py")
@@ -572,66 +537,29 @@ def build_app() -> Application:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # загрузка данных (бан‑лист)
     data = _load_persistent_data()
     banned = set(int(x) for x in (data.get("banned_users") or []) if str(x).isdigit())
     app.bot_data["banned_users"] = banned
 
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(MENU_WRITE)}$"), menu_write),
-            MessageHandler(filters.TEXT & filters.Regex(f"^{re.escape(MENU_DONATE)}$"), menu_donate),
-        ],
-        states={
-            WRITE_WAITING_MESSAGE: [
-                MessageHandler(
-                    # принимаем практически всё (кроме команд), чтобы переслать админу
-                    ~filters.COMMAND,
-                    write_receive_any,
-                )
-            ],
-            DONATE_WAITING_CUSTOM_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, donate_custom_amount)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate:"))
-    app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin:"))
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("bans", bans_list))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
 
-    # Админ отвечает reply'ем на скопированное сообщение
-    app.add_handler(
-        MessageHandler(
-            filters.User(user_id=ADMIN_ID) & filters.REPLY & ~filters.COMMAND,
-            admin_reply_to_user,
-        )
-    )
+    app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate:"))
+    app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin:"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
-    # Админ нажал "Ответить" и отправляет следующее сообщение без reply
-    app.add_handler(
-        MessageHandler(
-            filters.User(user_id=ADMIN_ID) & ~filters.COMMAND,
-            admin_send_pending_reply,
-        )
-    )
+    # Ответы админа (reply): на ForceReply-подсказку или на скопированное сообщение пользователя
+    app.add_handler(MessageHandler(filters.User(user_id=ADMIN_ID) & filters.REPLY, admin_reply_router))
 
-    # Пользовательский “фолбэк”, если пишет вне сценария
-    app.add_handler(MessageHandler(~filters.COMMAND, user_fallback_any))
-
+    # Все сообщения пользователей (автоответчик)
+    app.add_handler(MessageHandler(~filters.COMMAND & ~filters.SUCCESSFUL_PAYMENT, user_message_router))
     return app
 
 
 if __name__ == "__main__":
-    app = build_app()
-    log.info("Bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
