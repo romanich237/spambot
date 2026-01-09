@@ -245,6 +245,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args and context.args[0].lower() in {"donate", "gift"}:
         await menu_donate(update, context)
         return
+    # сбрасываем возможные “режимы ввода” при обычном /start
+    context.user_data.pop("awaiting_donate_amount", None)
     text = (
         "Привет, я <b>бот обратной связи</b>.\n\n"
         "Просто напиши сообщение — я передам его администратору.\n"
@@ -256,6 +258,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    # Если человек передумал донатить и пошёл писать — не трактуем следующий текст как сумму
+    context.user_data.pop("awaiting_donate_amount", None)
     await update.message.reply_text(
         "Пиши сообщение — я сразу отправлю его администратору.\n\n"
         "Можно отправлять: текст, фото, видео, голос, файл.",
@@ -625,6 +629,7 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     # но сообщения админа не должны пересылаться самому себе.
     if user.id == ADMIN_ID:
         if _is_menu_press(msg.text, MENU_WRITE):
+            context.user_data.pop("awaiting_donate_amount", None)
             await menu_write(update, context)
             raise ApplicationHandlerStop
         if _is_menu_press(msg.text, MENU_DONATE):
@@ -656,6 +661,7 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Кнопки меню (текстом)
     if _is_menu_press(msg.text, MENU_WRITE):
+        context.user_data.pop("awaiting_donate_amount", None)
         await menu_write(update, context)
         raise ApplicationHandlerStop
     if _is_menu_press(msg.text, MENU_DONATE):
@@ -712,6 +718,7 @@ async def user_write_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not q:
         return
     await q.answer()
+    context.user_data.pop("awaiting_donate_amount", None)
     await q.message.reply_text(
         "Пиши сообщение — я передам его администратору.",
         reply_markup=MAIN_MENU,
