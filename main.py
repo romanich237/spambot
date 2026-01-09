@@ -158,6 +158,9 @@ def _is_flooding(*, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if context.args and context.args[0].lower() in {"donate", "gift"}:
+        await menu_donate(update, context)
+        return
     text = (
         "Привет! Я работаю как <b>автоответчик‑курьер</b>.\n\n"
         "Ты пишешь мне — я мгновенно доставляю сообщение админу.\n"
