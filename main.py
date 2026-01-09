@@ -1,4 +1,6 @@
 import html
+import logging
+from logging.handlers import RotatingFileHandler
 
 import re
 import time
@@ -43,6 +45,16 @@ PRESET_STARS = (50, 100, 250, 500, 1000)
 DATA_PATH = Path(__file__).with_name("bot_data.json")
 FLOOD_WINDOW_SEC = 30
 FLOOD_MAX_MESSAGES = 4
+
+
+ERROR_LOG_PATH = Path(__file__).with_name("errors.log")
+_err_logger = logging.getLogger("bot-errors")
+_err_logger.setLevel(logging.ERROR)
+if not _err_logger.handlers:
+    _handler = RotatingFileHandler(ERROR_LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    _handler.setLevel(logging.ERROR)
+    _handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    _err_logger.addHandler(_handler)
 
 
 def _h(s: str) -> str:
@@ -205,8 +217,8 @@ async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message:
         return
     await update.message.reply_text(
-        "Я уже в режиме автоответчика 🙂\n\n"
-        "Просто напиши сообщение (текст/фото/видео/голос/файл) — я доставлю его админу.",
+        "Напиши сообщение — я мгновенно доставлю его админу.\n\n"
+        "Можно отправлять: текст, фото, видео, голос, файл.",
         reply_markup=MAIN_MENU,
     )
 
@@ -217,12 +229,12 @@ async def menu_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Пользователь может сразу написать сумму сообщением
     context.user_data["awaiting_donate_amount"] = True
     text = (
-        "Спасибо, что хочешь поддержать!\n\n"
-        "Оплата — в <b>Telegram Stars</b> (официальная валюта Telegram).\n"
-        "Выбери сумму кнопкой ниже или просто напиши число звёзд сообщением."
+        "🎁 <b>Подарок</b>\n\n"
+        "Напиши сумму звёздами одним сообщением (например: <code>50</code> или <code>50 ⭐</code>)\n"
+        "или выбери кнопку ниже."
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
-    await update.message.reply_text("Сколько звёзд отправим? ⭐", reply_markup=_donate_keyboard())
+    await update.message.reply_text("Выбери сумму:", reply_markup=_donate_keyboard())
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -317,6 +329,23 @@ async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer(ok=True)
     else:
         await q.answer(ok=False, error_message="Что-то пошло не так с платежом. Попробуй ещё раз.")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Логируем только ошибки (в файл errors.log)
+    try:
+        _err_logger.exception("Unhandled error", exc_info=context.error)
+    except Exception:
+        pass
+
+    # Дополнительно (лучше для поддержки): пингуем админа кратким сообщением
+    try:
+        err = context.error
+        msg = f"⚠️ Ошибка в боте: {type(err).__name__}: {err}"
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg)
+    except Exception:
+        # если сломалось уведомление — молча игнорируем, чтобы не зациклиться
+        pass
 
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -523,6 +552,9 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Меню должно работать и у админа (например, для теста доната),
     # но сообщения админа не должны пересылаться самому себе.
     if user.id == ADMIN_ID:
+        if _is_menu_press(msg.text, MENU_WRITE):
+            await menu_write(update, context)
+            raise ApplicationHandlerStop
         if _is_menu_press(msg.text, MENU_DONATE):
             await menu_donate(update, context)
             raise ApplicationHandlerStop
@@ -632,6 +664,7 @@ def build_app() -> Application:
 
     # Все сообщения пользователей (автоответчик)
     app.add_handler(MessageHandler(~filters.COMMAND & ~filters.SUCCESSFUL_PAYMENT, user_message_router))
+    app.add_error_handler(on_error)
     return app
 
 
