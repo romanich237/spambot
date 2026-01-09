@@ -1,12 +1,12 @@
-import logging
 import re
 import time
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, Optional, Set, List, Tuple
+from typing import Dict, Optional, Set, List
 
 from telegram import (
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
@@ -16,27 +16,16 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     PreCheckoutQueryHandler,
-    ConversationHandler,
     filters,
 )
 
 from config import ADMIN_ID, BOT_TOKEN
-
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("relay-bot")
-
-
-WRITE_WAITING_MESSAGE = 1
-DONATE_WAITING_CUSTOM_AMOUNT = 2
 
 
 MENU_WRITE = "✍️ Написать"
