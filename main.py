@@ -1,7 +1,10 @@
 import logging
 import re
+import time
+import json
+from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, List, Tuple
 
 from telegram import (
     InlineKeyboardButton,
@@ -49,6 +52,10 @@ MAIN_MENU = ReplyKeyboardMarkup(
 
 PRESET_STARS = (50, 100, 250, 500, 1000)
 
+DATA_PATH = Path(__file__).with_name("bot_data.json")
+FLOOD_WINDOW_SEC = 30
+FLOOD_MAX_MESSAGES = 4
+
 
 def _profile_url(u) -> str:
     # Если username нет, tg://user?id=... открывает профиль в большинстве клиентов
@@ -57,15 +64,18 @@ def _profile_url(u) -> str:
     return f"tg://user?id={u.id}"
 
 
-def _admin_user_keyboard(u) -> InlineKeyboardMarkup:
+def _admin_user_keyboard(*, user_id: int, profile_url: str, is_banned: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{u.id}"),
-                InlineKeyboardButton("Забанить", callback_data=f"admin:ban:{u.id}"),
+                InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{user_id}"),
+                InlineKeyboardButton(
+                    "Разбанить" if is_banned else "Забанить",
+                    callback_data=f"admin:{'unban' if is_banned else 'ban'}:{user_id}",
+                ),
             ],
             [
-                InlineKeyboardButton("Написать", url=_profile_url(u)),
+                InlineKeyboardButton("Написать", url=profile_url),
             ],
         ]
     )
@@ -121,6 +131,41 @@ def _admin_pending_reply(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
     return context.application.bot_data["admin_pending_reply"]
 
 
+def _flood_index(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, List[float]]:
+    # user_id -> timestamps (monotonic) последних сообщений
+    if "flood_index" not in context.application.bot_data:
+        context.application.bot_data["flood_index"] = {}
+    return context.application.bot_data["flood_index"]
+
+
+def _load_persistent_data() -> Dict[str, object]:
+    if not DATA_PATH.exists():
+        return {}
+    try:
+        raw = DATA_PATH.read_text(encoding="utf-8")
+        return json.loads(raw) if raw.strip() else {}
+    except Exception:
+        log.exception("Failed to load %s", DATA_PATH)
+        return {}
+
+
+def _save_persistent_data(*, banned_users: Set[int]) -> None:
+    data = {"banned_users": sorted(banned_users)}
+    tmp = DATA_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(DATA_PATH)
+
+
+def _is_flooding(*, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    now = time.monotonic()
+    idx = _flood_index(context)
+    stamps = idx.get(user_id, [])
+    stamps = [t for t in stamps if now - t <= FLOOD_WINDOW_SEC]
+    stamps.append(now)
+    idx[user_id] = stamps
+    return len(stamps) > FLOOD_MAX_MESSAGES
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
@@ -172,12 +217,23 @@ async def write_receive_any(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ConversationHandler.END
 
+    if _is_flooding(user_id=user.id, context=context):
+        await update.message.reply_text(
+            "Слишком быстро 🙂 Дай мне 20–30 секунд перевести дух и попробуй ещё раз.",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
     # 1) карточка отправителя
     await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=_user_card(user),
         parse_mode=ParseMode.HTML,
-        reply_markup=_admin_user_keyboard(user),
+        reply_markup=_admin_user_keyboard(
+            user_id=user.id,
+            profile_url=_profile_url(user),
+            is_banned=(user.id in _banned_users(context)),
+        ),
     )
 
     # 2) копия исходного сообщения (с сохранением медиа)
@@ -205,6 +261,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=MAIN_MENU,
         )
     return ConversationHandler.END
+
+
+async def user_fallback_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Если пользователь пишет не нажимая "Написать" — мягко направляем.
+    if not update.message:
+        return
+    if update.effective_user and update.effective_user.id == ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "Я тебя услышал 🙂\n\n"
+        "Чтобы я доставил сообщение админу, нажми кнопку <b>«Написать»</b> и отправь сообщение ещё раз.",
+        reply_markup=MAIN_MENU,
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def menu_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -406,11 +476,23 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "ban":
         banned = _banned_users(context)
         banned.add(user_id)
+        _save_persistent_data(banned_users=banned)
         pending = _admin_pending_reply(context)
         if pending.get(ADMIN_ID) == user_id:
             pending.pop(ADMIN_ID, None)
         await q.message.reply_text(
             f"Готово. Пользователь <code>{user_id}</code> забанен: новые сообщения от него не будут приниматься.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "unban":
+        banned = _banned_users(context)
+        if user_id in banned:
+            banned.remove(user_id)
+            _save_persistent_data(banned_users=banned)
+        await q.message.reply_text(
+            f"Готово. Пользователь <code>{user_id}</code> разбанен.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -439,6 +521,60 @@ async def admin_send_pending_reply(update: Update, context: ContextTypes.DEFAULT
     await msg.reply_text("Доставлено пользователю ✅")
 
 
+async def bans_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+
+    banned = sorted(_banned_users(context))
+    if not banned:
+        await update.message.reply_text("Бан‑лист пуст.")
+        return
+    text = "Бан‑лист:\n" + "\n".join(f"— <code>{uid}</code>" for uid in banned)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def _parse_id_arg(text: str) -> Optional[int]:
+    parts = (text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    user_id = _parse_id_arg(update.message.text or "")
+    if not user_id:
+        await update.message.reply_text("Использование: /ban <user_id>")
+        return
+    banned = _banned_users(context)
+    banned.add(user_id)
+    _save_persistent_data(banned_users=banned)
+    await update.message.reply_text(f"Забанен: <code>{user_id}</code>", parse_mode=ParseMode.HTML)
+
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    user_id = _parse_id_arg(update.message.text or "")
+    if not user_id:
+        await update.message.reply_text("Использование: /unban <user_id>")
+        return
+    banned = _banned_users(context)
+    banned.discard(user_id)
+    _save_persistent_data(banned_users=banned)
+    await update.message.reply_text(f"Разбанен: <code>{user_id}</code>", parse_mode=ParseMode.HTML)
+
+
 def build_app() -> Application:
     if not BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
         raise RuntimeError("Заполни BOT_TOKEN в config.py")
@@ -446,6 +582,11 @@ def build_app() -> Application:
         raise RuntimeError("Заполни ADMIN_ID (целое число) в config.py")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # загрузка данных (бан‑лист)
+    data = _load_persistent_data()
+    banned = set(int(x) for x in (data.get("banned_users") or []) if str(x).isdigit())
+    app.bot_data["banned_users"] = banned
 
     conv = ConversationHandler(
         entry_points=[
@@ -474,6 +615,9 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CommandHandler("bans", bans_list))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
 
     # Админ отвечает reply'ем на скопированное сообщение
     app.add_handler(
@@ -490,6 +634,9 @@ def build_app() -> Application:
             admin_send_pending_reply,
         )
     )
+
+    # Пользовательский “фолбэк”, если пишет вне сценария
+    app.add_handler(MessageHandler(~filters.COMMAND, user_fallback_any))
 
     return app
 
