@@ -58,6 +58,28 @@ def _is_menu_press(text: Optional[str], expected: str) -> bool:
     return _norm_button_text(text) == _norm_button_text(expected)
 
 
+def _parse_stars_amount(text: Optional[str]) -> Optional[int]:
+    """
+    Достаёт сумму Stars из сообщения.
+
+    Принимает: "50", "50⭐", "50 ⭐", "⭐50", "gift 50" и т.п.
+    Возвращает int или None, если нельзя понять однозначно.
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    nums = re.findall(r"\d{1,7}", s)
+    if len(nums) != 1:
+        return None
+    try:
+        stars = int(nums[0])
+    except ValueError:
+        return None
+    if stars <= 0 or stars > 1_000_000:
+        return None
+    return stars
+
+
 def _profile_url_by_user_id(user_id: int) -> str:
     return f"tg://user?id={user_id}"
 
@@ -505,16 +527,14 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
             await menu_donate(update, context)
             raise ApplicationHandlerStop
         if context.user_data.get("awaiting_donate_amount"):
-            raw = (msg.text or "").strip()
-            if not re.fullmatch(r"\d{1,6}", raw):
+            stars = _parse_stars_amount(msg.text)
+            if stars is None:
                 await msg.reply_text(
-                    "Нужно число звёзд (только цифры). Чтобы отменить — /cancel.",
+                    "Напиши сумму звёздами (например: <code>50</code> или <code>50 ⭐</code>). "
+                    "Чтобы отменить — /cancel.",
                     reply_markup=MAIN_MENU,
+                    parse_mode=ParseMode.HTML,
                 )
-                raise ApplicationHandlerStop
-            stars = int(raw)
-            if stars <= 0:
-                await msg.reply_text("Сумма должна быть больше нуля. Попробуй ещё раз.")
                 raise ApplicationHandlerStop
             context.user_data.pop("awaiting_donate_amount", None)
             await _send_stars_invoice(user_id=user.id, stars=stars, context=context)
@@ -540,13 +560,14 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Ввод своей суммы доната
     if context.user_data.get("awaiting_donate_amount"):
-        raw = (msg.text or "").strip()
-        if not re.fullmatch(r"\d{1,6}", raw):
-            await msg.reply_text("Нужно число звёзд (только цифры). Чтобы отменить — /cancel.")
-            raise ApplicationHandlerStop
-        stars = int(raw)
-        if stars <= 0:
-            await msg.reply_text("Сумма должна быть больше нуля. Попробуй ещё раз.")
+        stars = _parse_stars_amount(msg.text)
+        if stars is None:
+            await msg.reply_text(
+                "Напиши сумму звёздами (например: <code>50</code> или <code>50 ⭐</code>). "
+                "Чтобы отменить — /cancel.",
+                reply_markup=MAIN_MENU,
+                parse_mode=ParseMode.HTML,
+            )
             raise ApplicationHandlerStop
         context.user_data.pop("awaiting_donate_amount", None)
         await _send_stars_invoice(user_id=user.id, stars=stars, context=context)
