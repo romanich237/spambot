@@ -49,6 +49,15 @@ def _h(s: str) -> str:
     return html.escape(s or "")
 
 
+def _norm_button_text(s: Optional[str]) -> str:
+    # Некоторые клиенты могут присылать эмодзи без variation selector (FE0F)
+    return (s or "").replace("\ufe0f", "").strip()
+
+
+def _is_menu_press(text: Optional[str], expected: str) -> bool:
+    return _norm_button_text(text) == _norm_button_text(expected)
+
+
 def _profile_url_by_user_id(user_id: int) -> str:
     return f"tg://user?id={user_id}"
 
@@ -488,7 +497,29 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if not user:
         return
+
+    # Меню должно работать и у админа (например, для теста доната),
+    # но сообщения админа не должны пересылаться самому себе.
     if user.id == ADMIN_ID:
+        if _is_menu_press(msg.text, MENU_DONATE):
+            await menu_donate(update, context)
+            raise ApplicationHandlerStop
+        if context.user_data.get("awaiting_donate_amount"):
+            raw = (msg.text or "").strip()
+            if not re.fullmatch(r"\d{1,6}", raw):
+                await msg.reply_text(
+                    "Нужно число звёзд (только цифры). Чтобы отменить — /cancel.",
+                    reply_markup=MAIN_MENU,
+                )
+                raise ApplicationHandlerStop
+            stars = int(raw)
+            if stars <= 0:
+                await msg.reply_text("Сумма должна быть больше нуля. Попробуй ещё раз.")
+                raise ApplicationHandlerStop
+            context.user_data.pop("awaiting_donate_amount", None)
+            await _send_stars_invoice(user_id=user.id, stars=stars, context=context)
+            raise ApplicationHandlerStop
+        # Любые другие сообщения админа игнорируем (ответы обрабатываются отдельным хендлером)
         return
 
     if user.id in _banned_users(context):
@@ -500,10 +531,10 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         raise ApplicationHandlerStop
 
     # Кнопки меню (текстом)
-    if msg.text == MENU_WRITE:
+    if _is_menu_press(msg.text, MENU_WRITE):
         await menu_write(update, context)
         raise ApplicationHandlerStop
-    if msg.text == MENU_DONATE:
+    if _is_menu_press(msg.text, MENU_DONATE):
         await menu_donate(update, context)
         raise ApplicationHandlerStop
 
