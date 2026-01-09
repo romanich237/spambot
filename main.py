@@ -180,10 +180,12 @@ async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def menu_donate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    # Пользователь может сразу написать сумму сообщением
+    context.user_data["awaiting_donate_amount"] = True
     text = (
         "Спасибо, что хочешь поддержать!\n\n"
         "Оплата — в <b>Telegram Stars</b> (официальная валюта Telegram).\n"
-        "Выбери сумму или введи свою."
+        "Выбери сумму кнопкой ниже или просто напиши число звёзд сообщением."
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode=ParseMode.HTML)
     await update.message.reply_text("Сколько звёзд отправим? ⭐", reply_markup=_donate_keyboard())
@@ -197,6 +199,27 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Окей, отменил ввод суммы.", reply_markup=MAIN_MENU)
         return
     await update.message.reply_text("Окей.", reply_markup=MAIN_MENU)
+
+
+async def gift_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /gift <stars> — быстрый способ отправить Stars без кнопок.
+    """
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user or user.id == ADMIN_ID:
+        return
+
+    parts = (update.message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not re.fullmatch(r"\d{1,6}", parts[1]):
+        await update.message.reply_text("Использование: /gift <кол-во_звёзд> (например: /gift 123)")
+        return
+    stars = int(parts[1])
+    if stars <= 0:
+        await update.message.reply_text("Сумма должна быть больше нуля.")
+        return
+    await _send_stars_invoice(user_id=user.id, stars=stars, context=context)
 
 
 async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -224,7 +247,8 @@ async def donate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.message.reply_text("Не понял сумму. Попробуй ещё раз.", reply_markup=_donate_keyboard())
         return
 
-    await _send_stars_invoice(user_id=q.from_user.id, stars=stars, context=context, reply_to=q.message)
+    context.user_data.pop("awaiting_donate_amount", None)
+    await _send_stars_invoice(user_id=q.from_user.id, stars=stars, context=context)
 
 
 async def _send_stars_invoice(
@@ -232,10 +256,9 @@ async def _send_stars_invoice(
     user_id: int,
     stars: int,
     context: ContextTypes.DEFAULT_TYPE,
-    reply_to,
 ) -> None:
-    title = "Поддержка проекта ⭐"
-    description = "Спасибо! Это помогает проекту жить, развиваться и не терять чувство юмора."
+    title = "Подарок"
+    description = "Анонимный подарок"
     payload = f"donate_{user_id}_{stars}"
 
     await context.bot.send_invoice(
@@ -248,11 +271,7 @@ async def _send_stars_invoice(
         prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)],
         start_parameter="donate",
     )
-    if reply_to:
-        await reply_to.reply_text(
-            f"Сформировал счёт на <b>{stars} ⭐</b>.",
-            parse_mode=ParseMode.HTML,
-        )
+    # Не отправляем доп. подтверждение — Telegram сам показывает инвойс
 
 
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -496,7 +515,7 @@ async def user_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
             await msg.reply_text("Сумма должна быть больше нуля. Попробуй ещё раз.")
             raise ApplicationHandlerStop
         context.user_data.pop("awaiting_donate_amount", None)
-        await _send_stars_invoice(user_id=user.id, stars=stars, context=context, reply_to=msg)
+        await _send_stars_invoice(user_id=user.id, stars=stars, context=context)
         raise ApplicationHandlerStop
 
     if _is_flooding(user_id=user.id, context=context):
@@ -543,6 +562,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("gift", gift_cmd))
     app.add_handler(CommandHandler("bans", bans_list))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
