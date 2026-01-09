@@ -1,7 +1,7 @@
 import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from telegram import (
     InlineKeyboardButton,
@@ -50,6 +50,27 @@ MAIN_MENU = ReplyKeyboardMarkup(
 PRESET_STARS = (50, 100, 250, 500, 1000)
 
 
+def _profile_url(u) -> str:
+    # Если username нет, tg://user?id=... открывает профиль в большинстве клиентов
+    if getattr(u, "username", None):
+        return f"https://t.me/{u.username}"
+    return f"tg://user?id={u.id}"
+
+
+def _admin_user_keyboard(u) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Ответить", callback_data=f"admin:reply:{u.id}"),
+                InlineKeyboardButton("Забанить", callback_data=f"admin:ban:{u.id}"),
+            ],
+            [
+                InlineKeyboardButton("Написать", url=_profile_url(u)),
+            ],
+        ]
+    )
+
+
 def _user_card(u) -> str:
     username = f"@{u.username}" if u.username else "—"
     full_name = " ".join(p for p in [u.first_name, u.last_name] if p) or "—"
@@ -87,6 +108,19 @@ def _relay_index(context: ContextTypes.DEFAULT_TYPE) -> RelayIndex:
     return context.application.bot_data["relay_index"]
 
 
+def _banned_users(context: ContextTypes.DEFAULT_TYPE) -> Set[int]:
+    if "banned_users" not in context.application.bot_data:
+        context.application.bot_data["banned_users"] = set()
+    return context.application.bot_data["banned_users"]
+
+
+def _admin_pending_reply(context: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
+    # admin_id -> user_id
+    if "admin_pending_reply" not in context.application.bot_data:
+        context.application.bot_data["admin_pending_reply"] = {}
+    return context.application.bot_data["admin_pending_reply"]
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
@@ -103,6 +137,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def menu_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
+        return ConversationHandler.END
+
+    user = update.effective_user
+    if user and user.id in _banned_users(context):
+        await update.message.reply_text(
+            "Упс. Этот почтовый ящик для тебя закрыт.\n"
+            "Если думаешь, что это ошибка — попробуй связаться с админом другим способом.",
+            reply_markup=MAIN_MENU,
+        )
         return ConversationHandler.END
 
     text = (
@@ -122,11 +165,19 @@ async def write_receive_any(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not user:
         return ConversationHandler.END
 
+    if user.id in _banned_users(context):
+        await update.message.reply_text(
+            "Сообщение не отправлено: доступ к боту для тебя ограничен.",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
     # 1) карточка отправителя
     await context.bot.send_message(
         chat_id=ADMIN_ID,
         text=_user_card(user),
         parse_mode=ParseMode.HTML,
+        reply_markup=_admin_user_keyboard(user),
     )
 
     # 2) копия исходного сообщения (с сохранением медиа)
@@ -316,6 +367,78 @@ async def admin_reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE
     await msg.reply_text("Доставлено пользователю ✅")
 
 
+async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+
+    actor = update.effective_user
+    if not actor or actor.id != ADMIN_ID:
+        await q.answer("Эта панель только для администратора.", show_alert=True)
+        return
+
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("admin:"):
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+
+    action, raw_user_id = parts[1], parts[2]
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        return
+
+    if action == "reply":
+        pending = _admin_pending_reply(context)
+        pending[ADMIN_ID] = user_id
+        await q.message.reply_text(
+            "Режим ответа включён.\n"
+            "Напиши сообщение следующим сообщением — я доставлю его пользователю.\n"
+            "Чтобы отменить — напиши /cancel.",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    if action == "ban":
+        banned = _banned_users(context)
+        banned.add(user_id)
+        pending = _admin_pending_reply(context)
+        if pending.get(ADMIN_ID) == user_id:
+            pending.pop(ADMIN_ID, None)
+        await q.message.reply_text(
+            f"Готово. Пользователь <code>{user_id}</code> забанен: новые сообщения от него не будут приниматься.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+
+async def admin_send_pending_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg:
+        return
+
+    actor = update.effective_user
+    if not actor or actor.id != ADMIN_ID:
+        return
+
+    pending = _admin_pending_reply(context)
+    target_user_id = pending.get(ADMIN_ID)
+    if not target_user_id:
+        return
+
+    await context.bot.copy_message(
+        chat_id=target_user_id,
+        from_chat_id=msg.chat_id,
+        message_id=msg.message_id,
+    )
+    pending.pop(ADMIN_ID, None)
+    await msg.reply_text("Доставлено пользователю ✅")
+
+
 def build_app() -> Application:
     if not BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
         raise RuntimeError("Заполни BOT_TOKEN в config.py")
@@ -348,6 +471,7 @@ def build_app() -> Application:
 
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(donate_callback, pattern=r"^donate:"))
+    app.add_handler(CallbackQueryHandler(admin_action_callback, pattern=r"^admin:"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
 
@@ -356,6 +480,14 @@ def build_app() -> Application:
         MessageHandler(
             filters.User(user_id=ADMIN_ID) & filters.REPLY & ~filters.COMMAND,
             admin_reply_to_user,
+        )
+    )
+
+    # Админ нажал "Ответить" и отправляет следующее сообщение без reply
+    app.add_handler(
+        MessageHandler(
+            filters.User(user_id=ADMIN_ID) & ~filters.COMMAND,
+            admin_send_pending_reply,
         )
     )
 
